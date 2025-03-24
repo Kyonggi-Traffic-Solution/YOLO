@@ -26,7 +26,7 @@ load_dotenv()
 #Roboflow Inference API 설정
 CLIENT = InferenceHTTPClient(
     api_url="https://detect.roboflow.com",
-    api_key= os.environ.get('ROBOFLOW_API_KEY')
+    api_key= os.environ.get('ROBOFLOW2_API_KEY')
 )
 
 #이미지 저장 폴더 생성(폴더가 없을 경우)
@@ -89,6 +89,36 @@ def save_image_data(filename, datetime, latitude, longitude, label, confidence):
 def index():
     return render_template('index.html')
 
+@app.route('/test')
+def test():
+    temp_path = os.path.join('test', 'kick.jpg')
+    print(temp_path)
+    image = Image.open(temp_path)
+    # exif_data = image._getexif()
+    img = cv2.imread(temp_path)
+    h, w = img.shape[:2]
+    scale = 300 / max(h, w)
+    new_size = (int(w * scale), int(h * scale))
+    img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
+
+    result_kickboard = CLIENT.infer(img, model_id="kickboard-22-jt3v1/1")
+    print('result: ', result_kickboard)
+
+    result_person = CLIENT.infer(img, model_id="person-469rx-3u095/1")
+    print('result: ', result_person)
+
+    result_helmet = CLIENT.infer(img, model_id="helmet-nw6lg-i02zn/1")
+    print('result: ', result_helmet)
+
+    img = object_detection(result_kickboard['predictions'], img)
+    img = object_detection(result_person['predictions'], img)
+    img = object_detection(result_helmet['predictions'], img)
+
+    save_path = os.path.join('test2', 'testimg.jpg')
+    cv2.imwrite(save_path, img)
+    print(1)
+    return render_template('index.html')
+
 #yolo 객체 탐지
 @app.route('/detect', methods=['POST'])
 def detect():
@@ -111,55 +141,79 @@ def detect():
     
     #temp에 넣은 이미지 전처리
     img = cv2.imread(temp_path)
-    img = cv2.resize(img, (300,300))
-    if not lat or not lon:
-        os.remove(temp_path)
-        return jsonify({'error': 'No location data available, cannot upload the photo.'}), 400
+    h, w = img.shape[:2]
+    scale = 300 / max(h, w)
+    new_size = (int(w * scale), int(h * scale))
+    img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
 
-    #헬멧 감지 API 호출
-    result = CLIENT.infer(img, model_id="dku-opensourceai-15-helmet/1")
-    print('result: ', result)
+    # if not lat or not lon:
+    #     os.remove(temp_path)
+    #     return jsonify({'error': 'No location data available, cannot upload the photo.'}), 400
 
-    #감지된 객체 처리 및 박스 처리
-    predictions = result['predictions']
-    for prediction in predictions:
-        centerx = int(prediction['x'])
-        centery = int(prediction['y'])
-        symmetric = int(prediction['width'])/2
-        horizontal = int(prediction['height'])/2
-        
-        x1 = int(centerx - symmetric)
-        y1 = int(centery - horizontal)
-        x2 =  int(centerx + symmetric)
-        y2 =  int(centery + horizontal)
-        
-        label = prediction['class']
-        #label = str('Helmet')
-        conf = prediction['confidence']
-        #conf = 0.84
-        text = str(label) + ' ' + str(conf)
-
-        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 255), 2)
-        cv2.putText(img, text, (x1+5, y1+20 ), cv2.FONT_HERSHEY_PLAIN, 1.2, (255, 0, 255), 1)
+    result_kickboard = CLIENT.infer(img, model_id="kickboard-22-jt3v1/1")
+    print('result: ', result_kickboard)
 
 
     #os.remove(temp_path)
 
-    #헬멧 착용여부 판단
-    helmet_status = '미착용' if any(item['class'] == 'NoHelmet' or (item['class'] == 'Helmet' and item['confidence'] < 0.8) for item in result['predictions']) else '착용'
+    helmet_status = None
+    traffic_violation_detection = '위반사항 없음'
 
-    #헬멧 미착용 시 static에 사진데이터 저장
+    #헬멧 착용여부 판단
+    if any(item['confidence'] > 0.8 for item in result_kickboard['predictions']) :
+        img = object_detection(result_kickboard['predictions'], img)
+
+        result_person = CLIENT.infer(img, model_id="person-469rx-3u095/1")
+        print('result: ', result_person)
+
+
+        if any(item['confidence'] > 0.8 for item in result_person['predictions']) :
+            img = object_detection(result_person['predictions'], img)
+
+            result_helmet = CLIENT.infer(img, model_id="helmet-nw6lg-i02zn/1")
+            print('result: ', result_helmet)
+
+            if any(item['confidence'] > 0.8 for item in result_helmet['predictions'])  :
+                helmet_status = '착용'
+                img = object_detection(result_helmet['predictions'], img)
+            else:
+                helmet_status = '미착용'
+        else:
+            traffic_violation_detection = '사람 감지 실패'
+            return jsonify({'위반 감지': traffic_violation_detection})
+    else:
+        traffic_violation_detection = '킥보드 감지 실패'
+        return jsonify({'위반 감지': traffic_violation_detection})
+    
+    
+    #헬멧 미착용 시 static에 사진데이터 저장 / 함수화 예정
     if helmet_status == '미착용':
         '''save_filename = f"{filename[:-4]}_lat{lat}_lon{lon}_time{timestamp}.jpg"
         save_path = os.path.join(IMAGE_FOLDER, save_filename)'''
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
         filename = secure_filename(f"{timestamp}_{file.filename}")
         save_image_data(filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), lat, lon, "label", "0.1")
-        save_path = os.path.join('static', filename)
+        save_path = os.path.join('static/img/noHelmet', filename)
         cv2.imwrite(save_path, img)
         return jsonify({'helmet_status': helmet_status})
-    
-    return jsonify({'helmet_status': helmet_status})
+    elif helmet_status == '착용':
+        '''save_filename = f"{filename[:-4]}_lat{lat}_lon{lon}_time{timestamp}.jpg"
+        save_path = os.path.join(IMAGE_FOLDER, save_filename)'''
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = secure_filename(f"{timestamp}_{file.filename}")
+        save_image_data(filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), lat, lon, "label", "0.1")
+        save_path = os.path.join('static/img/Helmet', filename)
+        cv2.imwrite(save_path, img)
+        return jsonify({'helmet_status': helmet_status})
+    else :
+        '''save_filename = f"{filename[:-4]}_lat{lat}_lon{lon}_time{timestamp}.jpg"
+        save_path = os.path.join(IMAGE_FOLDER, save_filename)'''
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        filename = secure_filename(f"{timestamp}_{file.filename}")
+        save_image_data(filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), lat, lon, "label", "0.1")
+        save_path = os.path.join('static/img/notHelmet', filename)
+        cv2.imwrite(save_path, img)
+        return jsonify({'helmet_status': helmet_status})
 
 #이미지 EXIF 데이터에서 위도 경도 가져오는 함수
 def get_image_location(image):
@@ -189,6 +243,29 @@ def get_image_location(image):
             lon = -lon
         return lat, lon
     return None, None
+
+def object_detection(predictions, img):
+    for prediction in predictions:
+        centerx = int(prediction['x'])
+        centery = int(prediction['y'])
+        symmetric = int(prediction['width'])/2
+        horizontal = int(prediction['height'])/2
+        
+        x1 = int(centerx - symmetric)
+        y1 = int(centery - horizontal)
+        x2 =  int(centerx + symmetric)
+        y2 =  int(centery + horizontal)
+        
+        label = prediction['class']
+        #label = str('Helmet')
+        conf = prediction['confidence']
+        #conf = 0.84
+        text = str(label) + ' ' + str(conf)
+
+        cv2.rectangle(img, (x1, y1), (x2, y2), (255, 0, 255), 2)
+        cv2.putText(img, text, (x1+5, y1+20 ), cv2.FONT_HERSHEY_PLAIN, 1.2, (255, 0, 255), 1)
+    return img
+
 
 #객체 분할 후 탐지된 객체만 남기고 삭제 / 현재 사용 X
 def draw_segmented_objects(image, contours, label_cnt_idx, bubbles_count):
