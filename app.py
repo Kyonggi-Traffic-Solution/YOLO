@@ -16,9 +16,21 @@ from matplotlib import pyplot as plt
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
+import requests
 
 #Flask 앱 초기화
 app = Flask(__name__)
+
+#이미지 업로드 받기
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
 
 #.env 로드
 load_dotenv()
@@ -36,6 +48,8 @@ os.makedirs(IMAGE_FOLDER, exist_ok=True)
 #SQLite 데이터베이스 파일 경로 설정
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, 'image_data.db')
+
+num = 0
 
 #데이터베이스 초기화 및 테이블 생성 함수
 def init_db():
@@ -89,6 +103,26 @@ def save_image_data(filename, datetime, latitude, longitude, label, confidence):
 def index():
     return render_template('index.html')
 
+#이미지 업로드 받기
+@app.route('/upload', methods=['POST'])
+def upload_image():
+    # request.files 에 'image' 필드가 없으면 에러
+    if 'image' not in request.files:
+        return jsonify({'error': 'No image part'}), 400
+
+    file = request.files['image']
+    # 파일명이 비어있으면 에러
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        save_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(save_path)
+        return jsonify({'message': 'File uploaded', 'filename': filename}), 200
+    else:
+        return jsonify({'error': 'Invalid file type'}), 400
+
 @app.route('/test')
 def test():
     temp_path = os.path.join('test', 'kick.jpg')
@@ -122,6 +156,7 @@ def test():
 #yolo 객체 탐지
 @app.route('/detect', methods=['POST'])
 def detect():
+    global num
     file = request.files['file']
     if not file:
         return jsonify({'error': 'No file provided'}), 400
@@ -138,12 +173,31 @@ def detect():
     
     #temp에 넣은 이미지의 EXIF 데이터에서 위도 경도 추출
     lat, lon = get_image_location(image)
+
+    #위/경도 -> 도로명주소
+    if lat and lon and lat == lat and lon == lon:
+        apiurl = "https://api.vworld.kr/req/address?"
+        params = {
+            "service": "address",
+            "request": "getaddress",
+            "crs": "epsg:4326",
+            "point": f"{lon},{lat}",
+            "format": "json",
+            "type": "road",
+            "key": os.environ.get('VWORLD_API_KEY')
+        }
+        response = requests.get(apiurl, params=params)
+        if response.status_code == 200:
+            data = response.json()
+            if data['response'] :
+                road_addr = data['response']['result'][0]['text']
     
     #temp에 넣은 이미지 전처리
     img = cv2.imread(temp_path)
     h, w = img.shape[:2]
     scale = 300 / max(h, w)
     new_size = (int(w * scale), int(h * scale))
+    new_size = (int(300), int(300))
     img = cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
 
     # if not lat or not lon:
@@ -158,62 +212,73 @@ def detect():
 
     helmet_status = None
     traffic_violation_detection = '위반사항 없음'
+    result_helmet = None
 
     #헬멧 착용여부 판단
-    if any(item['confidence'] > 0.8 for item in result_kickboard['predictions']) :
-        img = object_detection(result_kickboard['predictions'], img)
+    if any(item['confidence'] > 0.1 for item in result_kickboard['predictions']) :
 
         result_person = CLIENT.infer(img, model_id="person-469rx-3u095/1")
         print('result: ', result_person)
 
 
-        if any(item['confidence'] > 0.8 for item in result_person['predictions']) :
-            img = object_detection(result_person['predictions'], img)
+        if any(item['confidence'] > 0.1 for item in result_person['predictions']) :
 
             result_helmet = CLIENT.infer(img, model_id="helmet-nw6lg-i02zn/1")
             print('result: ', result_helmet)
 
-            if any(item['confidence'] > 0.8 for item in result_helmet['predictions'])  :
+            if any(item['confidence'] > 0.1 for item in result_helmet['predictions'])  :
                 helmet_status = '착용'
                 img = object_detection(result_helmet['predictions'], img)
             else:
                 helmet_status = '미착용'
+                traffic_violation_detection = '헬멧 미착용'
         else:
             traffic_violation_detection = '사람 감지 실패'
-            return jsonify({'위반 감지': traffic_violation_detection})
+            #return jsonify({'위반 감지': traffic_violation_detection})
     else:
         traffic_violation_detection = '킥보드 감지 실패'
-        return jsonify({'위반 감지': traffic_violation_detection})
+        #return jsonify({'위반 감지': traffic_violation_detection})
     
     
     #헬멧 미착용 시 static에 사진데이터 저장 / 함수화 예정
-    if helmet_status == '미착용':
-        '''save_filename = f"{filename[:-4]}_lat{lat}_lon{lon}_time{timestamp}.jpg"
-        save_path = os.path.join(IMAGE_FOLDER, save_filename)'''
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        filename = secure_filename(f"{timestamp}_{file.filename}")
-        save_image_data(filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), lat, lon, "label", "0.1")
-        save_path = os.path.join('static/img/noHelmet', filename)
-        cv2.imwrite(save_path, img)
-        return jsonify({'helmet_status': helmet_status})
-    elif helmet_status == '착용':
-        '''save_filename = f"{filename[:-4]}_lat{lat}_lon{lon}_time{timestamp}.jpg"
-        save_path = os.path.join(IMAGE_FOLDER, save_filename)'''
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        filename = secure_filename(f"{timestamp}_{file.filename}")
-        save_image_data(filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), lat, lon, "label", "0.1")
-        save_path = os.path.join('static/img/Helmet', filename)
-        cv2.imwrite(save_path, img)
-        return jsonify({'helmet_status': helmet_status})
-    else :
-        '''save_filename = f"{filename[:-4]}_lat{lat}_lon{lon}_time{timestamp}.jpg"
-        save_path = os.path.join(IMAGE_FOLDER, save_filename)'''
-        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        filename = secure_filename(f"{timestamp}_{file.filename}")
-        save_image_data(filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), lat, lon, "label", "0.1")
-        save_path = os.path.join('static/img/notHelmet', filename)
-        cv2.imwrite(save_path, img)
-        return jsonify({'helmet_status': helmet_status})
+    if helmet_status == '미착용': save_uri = 'noHelmet'
+    elif helmet_status == '착용': save_uri = 'Helmet'
+    else : save_uri = 'notHelmet'
+
+    '''save_filename = f"{filename[:-4]}_lat{lat}_lon{lon}_time{timestamp}.jpg"
+    save_path = os.path.join(IMAGE_FOLDER, save_filename)'''
+    timestamp = datetime.datetime.now().strftime("%Y%m%d")
+    base, ext = os.path.splitext(file.filename)
+    if not ext:
+        ext = '.jpg'   # 기본 확장자 지정
+    filename = secure_filename(f"{timestamp}_{num}{ext}")
+    num+=1
+    save_image_data(filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), lat, lon, "label", "0.1")
+    save_path = os.path.join('static/img/' + save_uri, filename)
+    cv2.imwrite(save_path, img)
+
+    #헬멧 라벨, 컨피던스, 위도, 경도, 도로명주소, 브랜드, 파일이름, 위반내용
+    print(f"헬멧 라벨       : {helmet_status}")
+    if not result_helmet == None and result_helmet['predictions']:
+        print(f"측정값          : {result_helmet['predictions'][0]['confidence']:.2f}")
+    else:
+        print("측정값          : 없음")
+
+    if lat and lon and lat == lat and lon == lon:
+        print(f"위/경도         : {lat} / {lon}")
+        print(f"도로명주소      : {road_addr}")
+    else:
+        print("위/경도         : 없음")
+        print("도로명주소      : 없음")
+
+    print("브랜드          : ")
+    print(f"파일이름        : {filename}")
+    print(f"위반내용        : {traffic_violation_detection}")
+
+
+    return jsonify({'helmet_status': helmet_status})
+
+    
 
 #이미지 EXIF 데이터에서 위도 경도 가져오는 함수
 def get_image_location(image):
